@@ -1,0 +1,285 @@
+---
+title: "Plantlist"
+author: "sxj"
+date: "2024-10-21"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+### 1. TPL物种名称校对并构建巨型系统发育树
+```{r}
+# 安装remotes包，用于从GitHub安装R包
+# install.packages("remotes")
+
+# 使用remotes安装plantlist包
+# remotes::install_github("helixcn/plantlist", build_vignettes = TRUE)
+
+# 加载plantlist和openxlsx库
+library(plantlist)
+library(openxlsx)
+
+# 读取包含物种列表的Excel文件
+ls <- read.xlsx("./splist.xlsx")
+
+# 提取拉丁学名
+sp <- ls$Latinname
+
+# 使用TPL函数对物种名称进行校对
+res <- TPL(sp)
+
+# 生成物种分类表
+taxa.table(res)
+
+# 显示校对结果的前几行数据
+head(res)
+
+# 将校对结果保存为CSV文件
+write.csv(res,"./tpl_sp.csv")
+
+# 安装并加载V.PhyloMaker2包，用于构建系统发育树
+# devtools::install_github("jinyizju/V.PhyloMaker2")
+library("V.PhyloMaker2")
+
+# 读取校对后的物种列表
+example <- read.csv("./tpl_sp.csv")[2:4]
+colnames(example) <- c("species", "genus", "family")
+
+# 显示数据的前几行
+head(example)
+
+# 使用phylo.maker函数基于GBOTB.extended.TPL数据生成系统发育树
+tree <- phylo.maker(sp.list = example, tree = GBOTB.extended.TPL, nodes = nodes.info.1.TPL, scenarios = "S3")
+
+# 绘制生成的系统发育树
+plot(tree$scenario.3)
+
+# 将系统发育树保存为文件
+write.tree(tree$scenario.3, "./tpl_sp.tre")
+```
+###2. 获取GBIF数据
+```{r}
+# 加载rgbif和dplyr包
+library(rgbif)
+library(dplyr)
+library(purrr)
+# 提取物种列表
+species_list <- example
+
+# 遍历物种列表，并使用taxize包查询GBIF的taxon keys
+gbif_taxon_keys <- 
+  species_list %>% 
+  pull("species") %>%  # 提取物种名称列
+  taxize::get_gbifid_(method="backbone") %>%  # 查询GBIF中的物种ID
+  imap(~ .x %>% mutate(original_sciname = .y)) %>%  # 保留原始学名
+  bind_rows() %T>%  # 结合查询结果
+  filter(matchtype == "EXACT" & status == "ACCEPTED") %>%  # 筛选匹配结果为EXACT并且状态为已接受的记录
+  filter(kingdom == "Plantae") %>%  # 只保留植物界的物种
+  pull(usagekey)  # 获取GBIF中的使用键（taxonKey）
+
+# 使用GBIF指定物种的出现记录
+occ_download(pred_in("taxonKey", gbif_taxon_keys),
+             format = "SIMPLE_CSV", user="用户名", pwd="密码", email="注册邮箱")
+```
+###3. 基于空间范围和物种出现点进行筛选和可视化
+```{r}
+# 加载空间数据处理的包
+library(sf)
+library(dplyr)
+
+# 读取中国的Shapefile文件
+shp <- st_read("./China.shp")
+
+# 读取GBIF数据
+occ_data <- read.csv("./gbif_data.csv", header = TRUE, sep = "\t")
+
+# 筛选物种名称和经纬度
+occ_data_selected <- occ_data %>%
+  dplyr::select(species, decimalLongitude, decimalLatitude)
+
+# 确保经纬度为数值类型
+occ_data_selected$decimalLongitude <- as.numeric(occ_data_selected$decimalLongitude)
+occ_data_selected$decimalLatitude <- as.numeric(occ_data_selected$decimalLatitude)
+
+# 检查经度列的数据分布情况
+summary(occ_data_selected$decimalLongitude)
+
+# 过滤掉缺少经纬度信息的记录
+occ_data_selected <- occ_data_selected %>%
+  dplyr::filter(!is.na(decimalLongitude) & !is.na(decimalLatitude))
+
+# 将物种出现数据转换为空间数据格式
+occ_sf <- st_as_sf(occ_data_selected, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+# 将物种出现点的坐标系转换为中国地图的坐标系
+occ_sf <- st_transform(occ_sf, st_crs(shp))
+
+# 获取无效几何的索引
+invalid_index <- which(st_is_valid(shp) == FALSE)
+
+# 提取无效几何
+invalid_geom <- shp[invalid_index, ]
+valid_geom <- shp[-invalid_index, ]
+# 只使用有效几何进行裁剪
+occ_sf <- st_intersection(occ_sf, valid_geom)
+
+# 提取裁剪后的空间坐标
+coordinates <- st_coordinates(occ_sf)
+
+# 将经纬度添加到原始数据框中
+occ_df <- as.data.frame(occ_sf)
+occ_df$longitude <- coordinates[,1]  # 提取经度
+occ_df$latitude <- coordinates[,2]   # 提取纬度
+
+# 基于经纬度去重，并保留所有物种记录
+occ_df <- occ_df %>% distinct(species, longitude, latitude, .keep_all = TRUE)
+occ <- occ_df[, c("species", "longitude", "latitude")]
+
+# 保存去重后的数据为CSV文件
+write.csv(occ, "./occ.csv", row.names = FALSE)
+```
+###4. Phylogenetic diversity 计算
+```{r}
+# 加载相关包用于多样性分析和栅格操作
+library(raster)
+library(sf)
+library(ecospat)
+library(ape)
+
+# 1. 读取中国地图Shapefile文件
+china_shp <- st_read("./China.shp")
+
+# 读取系统发育树文件
+tree <- read.tree("./tpl_sp.tre")
+
+# 2. 创建基础栅格，并定义分辨率
+base_raster <- raster(extent(china_shp), resolution = 0.1, crs = st_crs(china_shp)$proj4string)
+
+# 3. 将Shapefile转换为栅格
+china_raster <- rasterize(china_shp, base_raster, field = 1)
+
+# 4. 绘制中国地图的栅格表示
+plot(china_raster, main = "China Shapefile as Raster")
+
+# 读取物种出现数据，并匹配系统发育树中的物种
+china <- read.csv("./occ.csv", h = T)
+unique_species <- as.data.frame(tree$tip.label)
+china$species <- gsub(" ", "_", china$species)
+china <- subset(china, china$species %in% unique_species[, 1])
+
+# 提取非NA的栅格单元坐标
+raster_df <- as.data.frame(china_raster, xy = TRUE, na.rm = FALSE)
+non_na_indices <- which(!is.na(raster_df[, 3]))
+
+# 获取非NA栅格单元的坐标
+non_na_coords <- raster_df[non_na_indices, 1:2]
+
+# 为这些非NA单元创建物种存在-缺失矩阵
+species_matrix <- matrix(0, nrow = length(non_na_indices), ncol = nrow(unique_species))
+colnames(species_matrix) <- unique_species$`tree$tip.label`
+
+# 匹配物种的经纬度到这些非NA栅格单元
+coords <- china[, c("longitude", "latitude")]
+raster_cells <- extract(china_raster, coords, cellnumbers = TRUE)[, 1]
+
+# 将物种存在情况填入矩阵
+for (i in 1:nrow(china)) {
+  species_name <- china$species[i]
+  cell_index <- raster_cells[i]
+  if (!is.na(cell_index) && cell_index %in% non_na_indices) {
+    species_matrix[which(non_na_indices == cell_index), species_name] <- 1
+  }
+}
+
+# 计算系统发育多样性 (PD)
+pd_result <- pd(species_matrix, tree, include.root = FALSE)
+
+# 创建包含PD值的栅格
+pd_values <- rep(NA, nrow(raster_df))
+pd_values[non_na_indices] <- pd_result$PD
+
+# 组合坐标和PD值
+pd.now <- cbind(raster_df[, 1:2], pd_values)
+colnames(pd.now) <- c("x", "y", "PD")
+
+# 生成包含PD值的栅格
+pd.dif <- rasterFromXYZ(pd.now)
+crs(pd.dif) <- crs(china_raster)
+
+# 绘制PD栅格图
+plot(pd.dif,main="PD")
+
+# 将PD栅格导出为GeoTIFF格式文件
+writeRaster(pd.dif, filename = "pd.tif", format = "GTiff", overwrite = TRUE)
+
+# 同理生成物种丰富度 (SR) 栅格图
+SR_values <- rep(NA, nrow(raster_df))
+SR_values[non_na_indices] <- pd_result$SR
+
+SR.now <- cbind(raster_df[, 1:2], SR_values)
+colnames(SR.now) <- c("x", "y", "SR")
+
+SR.dif <- rasterFromXYZ(SR.now)
+crs(SR.dif) <- crs(china_raster)
+
+# 绘制SR栅格图
+plot(SR.dif)
+
+# 导出SR栅格文件
+writeRaster(SR.dif, filename = "SR.tif", format = "GTiff", overwrite = TRUE)
+```
+###5、获取气候数据
+```{r}
+# 加载raster包
+library(raster)
+library(geodata)
+# 下载当前气候条件下的生物气候变量（例如：WorldClim数据）
+# 设置分辨率为10分（0.1度），可以根据需要调整
+clim_data <- worldclim_global(var = "bio", res = 10, path = "./")
+
+# 显示下载的气候数据的基本信息
+print(clim_data)
+shp <- st_read("./China.shp")
+# 提取特定研究区域的气候数据，例如中国的气候
+china_extent <- extent(shp)  # 以中国Shapefile的范围为基础
+china_clim_data <- crop(clim_data, china_extent)
+for (i in 1:nlyr(china_clim_data)) {
+  # 构建文件名，例如 "bio_1.tif", "bio_2.tif" 等
+  layer_name <- names(china_clim_data)[i]
+  file_name <- paste0("./bio", layer_name, ".tif")
+  
+  # 保存单层气候数据
+  writeRaster(china_clim_data[[i]], filename = file_name, overwrite = TRUE)
+  
+  # 打印保存进度
+  print(paste("Saved:", file_name))
+}
+```
+###6、生态位建模
+```{r}
+# 加载maxent和其他相关包
+library(dismo)
+library(raster)
+
+# 加载物种出现点和气候数据
+occ_points <- read.csv("./occ.csv")  # 之前生成的物种分布数据
+files <- list.files("./bio",pattern = 'tif',full.names = TRUE)
+clim_stack <- stack(files) # 将多个气候因子堆栈在一起
+#选择某一个物种进行建模，以"Ageratina adenophora"为例
+occ <- subset(occ_points,occ_points$species=="Ageratina adenophora")
+# 准备物种分布数据，提取存在点的气候信息
+species_occ <- occ[, c("longitude", "latitude")]
+
+# 进行MaxEnt建模
+maxent_model <- maxent(clim_stack, species_occ)
+
+# 预测物种的潜在分布
+predict_map <- predict(maxent_model, clim_stack)
+
+# 可视化预测结果
+plot(predict_map, main = "Species Distribution Prediction")
+
+# 保存预测结果
+writeRaster(predict_map, filename = "Ageratina adenophora_distribution_prediction.tif", overwrite = TRUE)
+```
+

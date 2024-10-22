@@ -143,7 +143,7 @@ write.csv(occ, "./occ.csv", row.names = FALSE)
 # 加载相关包用于多样性分析和栅格操作
 library(raster)
 library(sf)
-library(ecospat)
+library(picante)
 library(ape)
 
 # 1. 读取中国地图Shapefile文件
